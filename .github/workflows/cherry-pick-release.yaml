@@ -1,0 +1,64 @@
+name: Cherry-pick dev to main on release
+
+on:
+  release:
+    types: [published]  # Trigger when a release is published
+
+concurrency:
+  group: cherrypick-on-release
+  cancel-in-progress: false
+
+jobs:
+  cherry-pick:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to push with GITHUB_TOKEN
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # fetch full history so rev-list works
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch branches and reset local main
+        run: |
+          git fetch origin main dev --prune
+          git checkout main
+          git reset --hard origin/main
+
+      - name: Cherry-pick commits from dev onto main
+        id: cherry
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Commits reachable from dev but not from main, oldest first
+          COMMITS="$(git rev-list --reverse ^origin/main origin/dev || true)"
+
+          if [ -z "${COMMITS}" ]; then
+            echo "No commits to cherry-pick."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for c in $COMMITS; do
+            echo "Cherry-picking $c"
+            if ! git cherry-pick -x "$c"; then
+              echo "Conflict encountered on $c. Aborting cherry-pick."
+              git cherry-pick --abort || true
+              exit 1
+            fi
+          done
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push updates to main
+        if: steps.cherry.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Push to main
+          git push origin HEAD:main
