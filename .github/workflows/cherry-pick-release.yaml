@@ -30,30 +30,108 @@ jobs:
           git checkout main
           git reset --hard origin/main
 
-      - name: Cherry-pick commits from dev onto main
+      - name: Cherry-pick ONLY commits listed in release description
         id: cherry
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Commits reachable from dev but not from main, oldest first
-          COMMITS="$(git rev-list --reverse ^origin/main origin/dev || true)"
-
-          if [ -z "${COMMITS}" ]; then
-            echo "No commits to cherry-pick."
+          
+          # Read release body
+          BODY="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
+          
+          # Prefer tokens inside [cherry-pick] ... [/cherry-pick] markers; fall back to whole body
+          SECTION="$(awk '/\[cherry-pick\]/{flag=1;next}/\[\/cherry-pick\]/{flag=0}flag' <<< "$BODY" || true)"
+          TEXT="${SECTION:-$BODY}"
+          
+          # Normalize separators and extract tokens (commit SHAs or PR numbers like #123)
+          TOKENS="$(echo "$TEXT" | tr ',;' ' ' | grep -Eo '([0-9a-f]{7,40}|#[0-9]+)' || true)"
+          
+          if [ -z "${TOKENS}" ]; then
+            echo "No cherry-pick tokens found in release body."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          for c in $COMMITS; do
-            echo "Cherry-picking $c"
-            if ! git cherry-pick -x "$c"; then
-              echo "Conflict encountered on $c. Aborting cherry-pick."
+          
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          API="https://api.github.com"
+          AUTH_HEADER="Authorization: Bearer ${GITHUB_TOKEN}"
+          ACCEPT_HEADER="Accept: application/vnd.github+json"
+          
+          declare -a ORDERED_UNIQUE_TOKENS=()
+          declare -A SEEN
+          for t in $TOKENS; do
+            if [ -z "${SEEN[$t]+x}" ]; then
+              SEEN[$t]=1
+              ORDERED_UNIQUE_TOKENS+=("$t")
+            fi
+          done
+          
+          declare -a COMMITS=()
+          
+          # Resolve tokens to concrete commit SHAs
+          for t in "${ORDERED_UNIQUE_TOKENS[@]}"; do
+            if [[ "$t" =~ ^#[0-9]+$ ]]; then
+              PR_NUM="${t#\#}"
+              echo "Resolving PR #$PR_NUM to merge commit..."
+              RESP="$(curl -sS -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" "$API/repos/${OWNER_REPO}/pulls/${PR_NUM}")"
+              MERGE_SHA="$(jq -r '.merge_commit_sha // empty' <<< "$RESP")"
+              if [ -z "$MERGE_SHA" ] || [ "$MERGE_SHA" = "null" ]; then
+                echo "Warning: PR #$PR_NUM has no merge commit (maybe not merged). Skipping."
+                continue
+              fi
+              COMMITS+=("$MERGE_SHA")
+            else
+              # Commit SHA (short or full)
+              COMMITS+=("$t")
+            fi
+          done
+          
+          if [ "${#COMMITS[@]}" -eq 0 ]; then
+            echo "No resolvable commits detected from tokens."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Ensure we have the latest refs
+          git fetch origin main dev --prune
+          
+          PICKED_ANY=false
+          for c in "${COMMITS[@]}"; do
+            # Expand to full SHA if abbreviated
+            FULL_SHA="$(git rev-parse "$c" 2>/dev/null || true)"
+            if [ -z "$FULL_SHA" ]; then
+              echo "Warning: Commit '$c' cannot be resolved locally. Skipping."
+              continue
+            fi
+          
+            # Must be reachable from dev
+            if ! git merge-base --is-ancestor "$FULL_SHA" origin/dev; then
+              echo "Warning: $FULL_SHA is not on origin/dev. Skipping."
+              continue
+            fi
+          
+            # Skip if already on main
+            if git merge-base --is-ancestor "$FULL_SHA" origin/main; then
+              echo "Info: $FULL_SHA already on origin/main. Skipping."
+              continue
+            fi
+          
+            echo "Cherry-picking $FULL_SHA"
+            if ! git cherry-pick -x "$FULL_SHA"; then
+              echo "Conflict encountered on $FULL_SHA. Aborting cherry-pick."
               git cherry-pick --abort || true
               exit 1
             fi
+            PICKED_ANY=true
           done
-
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          
+          if [ "$PICKED_ANY" = true ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Push updates to main
         if: steps.cherry.outputs.changed == 'true'
